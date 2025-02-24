@@ -5,10 +5,57 @@ import (
 	"fmt"
 	"strings"
 
-	"github.com/carloberd/db-reader/postgresql/models"
+	t "github.com/carloberd/db-reader/types"
+	_ "github.com/lib/pq" // PostgreSQL driver
 )
 
-func GetTableList(db *sql.DB, schema string) ([]string, error) {
+// PostgresConnector implements the DatabaseConnector interface for PostgreSQL
+type PostgresConnector struct {
+	db *sql.DB
+}
+
+// Connect establishes a connection to the PostgreSQL database
+func (pc *PostgresConnector) Connect(params t.ConnectionParams) error {
+	// Create connection string
+	dsn := fmt.Sprintf("host=%s port=%s user=%s password=%s dbname=%s sslmode=disable",
+		params.Host, params.Port, params.User, params.Password, params.Database)
+
+	// Open the connection
+	var err error
+	pc.db, err = sql.Open("postgres", dsn)
+	if err != nil {
+		return fmt.Errorf("failed to connect to database: %v", err)
+	}
+
+	// Test the connection
+	err = pc.db.Ping()
+	if err != nil {
+		pc.db.Close()
+		pc.db = nil
+		return fmt.Errorf("failed to ping database: %v", err)
+	}
+
+	return nil
+}
+
+// Disconnect closes the database connection
+func (pc *PostgresConnector) Disconnect() error {
+	if pc.db != nil {
+		err := pc.db.Close()
+		pc.db = nil
+		if err != nil {
+			return fmt.Errorf("error closing database connection: %v", err)
+		}
+	}
+	return nil
+}
+
+// GetTables returns a list of tables in the specified schema
+func (pc *PostgresConnector) GetTables(schema string) ([]string, error) {
+	if pc.db == nil {
+		return nil, fmt.Errorf("not connected to database")
+	}
+
 	query := `
 		SELECT 
 			table_name 
@@ -22,9 +69,9 @@ func GetTableList(db *sql.DB, schema string) ([]string, error) {
 			table_name
 	`
 
-	rows, err := db.Query(query, schema)
+	rows, err := pc.db.Query(query, schema)
 	if err != nil {
-		return nil, fmt.Errorf("an error occurred fetching tables: %v", err)
+		return nil, fmt.Errorf("error querying tables: %v", err)
 	}
 	defer rows.Close()
 
@@ -32,7 +79,7 @@ func GetTableList(db *sql.DB, schema string) ([]string, error) {
 	for rows.Next() {
 		var tableName string
 		if err := rows.Scan(&tableName); err != nil {
-			return nil, fmt.Errorf("an error occurred scanning table: %v", err)
+			return nil, fmt.Errorf("error scanning table results: %v", err)
 		}
 		tables = append(tables, tableName)
 	}
@@ -40,8 +87,25 @@ func GetTableList(db *sql.DB, schema string) ([]string, error) {
 	return tables, nil
 }
 
-func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, error) {
-	// Verifica prima se la tabella esiste
+// formatDataType converts PostgreSQL type names to more concise formats
+func formatDataType(pgType string) string {
+	// Replace "character varying" with "varchar"
+	pgType = strings.Replace(pgType, "character varying", "varchar", -1)
+
+	// Other replacements
+	pgType = strings.Replace(pgType, "character", "char", -1)
+	pgType = strings.Replace(pgType, "double precision", "double", -1)
+
+	return pgType
+}
+
+// GetTableStructure returns the structure of the specified table
+func (pc *PostgresConnector) GetTableStructure(schema, tableName string) (*t.Table, error) {
+	if pc.db == nil {
+		return nil, fmt.Errorf("not connected to database")
+	}
+
+	// Check if table exists
 	var exists bool
 	checkQuery := `
 		SELECT EXISTS (
@@ -51,20 +115,21 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 			AND table_name = $2
 		)
 	`
-	err := db.QueryRow(checkQuery, schema, tableName).Scan(&exists)
+	err := pc.db.QueryRow(checkQuery, schema, tableName).Scan(&exists)
 	if err != nil {
-		return nil, fmt.Errorf("an error occurred checking table existence: %v", err)
+		return nil, fmt.Errorf("error checking table existence: %v", err)
 	}
 
 	if !exists {
-		return nil, fmt.Errorf("the table '%s.%s' does not exist", schema, tableName)
+		return nil, fmt.Errorf("table '%s.%s' does not exist", schema, tableName)
 	}
 
-	table := &models.Table{
+	table := &t.Table{
 		Name:   tableName,
 		Schema: schema,
 	}
 
+	// Get column information with foreign keys
 	query := `
 		SELECT 
 			a.attname AS column_name,
@@ -100,14 +165,14 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 			a.attnum
 	`
 
-	rows, err := db.Query(query, tableName, schema)
+	rows, err := pc.db.Query(query, tableName, schema)
 	if err != nil {
-		return nil, fmt.Errorf("an error occurred fetching columns: %v", err)
+		return nil, fmt.Errorf("error querying columns: %v", err)
 	}
 	defer rows.Close()
 
 	for rows.Next() {
-		var col models.Column
+		var col t.Column
 		var defaultValue sql.NullString
 		var pgType string
 		var foreignKeyRef sql.NullString
@@ -121,7 +186,7 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 			&foreignKeyRef,
 		)
 		if err != nil {
-			return nil, fmt.Errorf("an error occurred scanning columns: %v", err)
+			return nil, fmt.Errorf("error scanning column results: %v", err)
 		}
 
 		col.Type = formatDataType(pgType)
@@ -130,6 +195,7 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 		table.Columns = append(table.Columns, col)
 	}
 
+	// Get index information
 	indexQuery := `
 		SELECT
 			i.relname AS index_name,
@@ -155,13 +221,13 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 			i.relname, a.attnum
 	`
 
-	indexRows, err := db.Query(indexQuery, tableName, schema)
+	indexRows, err := pc.db.Query(indexQuery, tableName, schema)
 	if err != nil {
-		return nil, fmt.Errorf("an error occurred fetching indexes: %v", err)
+		return nil, fmt.Errorf("error querying indexes: %v", err)
 	}
 	defer indexRows.Close()
 
-	indexMap := make(map[string]*models.Index)
+	indexMap := make(map[string]*t.Index)
 
 	for indexRows.Next() {
 		var indexName, columnName string
@@ -169,13 +235,13 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 
 		err := indexRows.Scan(&indexName, &columnName, &isUnique, &isPrimary)
 		if err != nil {
-			return nil, fmt.Errorf("an error occurred scanning indexes: %v", err)
+			return nil, fmt.Errorf("error scanning index results: %v", err)
 		}
 
 		if idx, exists := indexMap[indexName]; exists {
 			idx.Columns = append(idx.Columns, columnName)
 		} else {
-			idx := &models.Index{
+			idx := &t.Index{
 				Name:       indexName,
 				Columns:    []string{columnName},
 				Unique:     isUnique,
@@ -185,7 +251,7 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 		}
 	}
 
-	// Converts indexes map to slice
+	// Convert map to slice
 	for _, idx := range indexMap {
 		table.Indexes = append(table.Indexes, *idx)
 	}
@@ -193,52 +259,7 @@ func GetTableStructure(db *sql.DB, schema, tableName string) (*models.Table, err
 	return table, nil
 }
 
-// Format PostgreSQL type in a more compact form
-func formatDataType(pgType string) string {
-	// Replace "character varying" with "varchar"
-	pgType = strings.Replace(pgType, "character varying", "varchar", -1)
-
-	// More replacements
-	pgType = strings.Replace(pgType, "character", "char", -1)
-	pgType = strings.Replace(pgType, "double precision", "double", -1)
-	pgType = strings.Replace(pgType, "timestamp without time zone", "timestamp", -1)
-	pgType = strings.Replace(pgType, "timestamp with time zone", "timestampz", -1)
-
-	return pgType
-}
-
-func PrintTableStructure(table *models.Table) {
-	fmt.Printf("\nTable structure '%s.%s':\n\n", table.Schema, table.Name)
-
-	fmt.Println("COLONNE:")
-	fmt.Printf("%-20s %-25s %-10s %-25s %-10s %-25s\n",
-		"Name", "Type", "Nullable", "Default", "Primary Key", "Foreign Key")
-	fmt.Println(strings.Repeat("-", 115))
-
-	for _, col := range table.Columns {
-		defaultVal := "NULL"
-		if col.DefaultValue.Valid {
-			defaultVal = col.DefaultValue.String
-		}
-
-		foreignKey := ""
-		if col.ForeignKey.Valid {
-			foreignKey = col.ForeignKey.String
-		}
-
-		fmt.Printf("%-20s %-25s %-10t %-25s %-10t %-25s\n",
-			col.Name, col.Type, col.Nullable, defaultVal, col.IsPrimaryKey, foreignKey)
-	}
-
-	if len(table.Indexes) > 0 {
-		fmt.Println("\nINDEXES:")
-		fmt.Printf("%-30s %-40s %-10s %-10s\n", "Name", "Columns", "Unique", "Primary Key")
-		fmt.Println(strings.Repeat("-", 90))
-
-		for _, idx := range table.Indexes {
-			columns := strings.Join(idx.Columns, ", ")
-			fmt.Printf("%-30s %-40s %-10t %-10t\n",
-				idx.Name, columns, idx.Unique, idx.PrimaryKey)
-		}
-	}
+// Implementation of factory method
+func NewPostgresConnector() t.DatabaseConnector {
+	return &PostgresConnector{}
 }
